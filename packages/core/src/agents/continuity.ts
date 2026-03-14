@@ -47,11 +47,17 @@ const DIMENSION_MAP: Record<number, string> = {
   25: "弧线平坦",
   26: "节奏单调",
   27: "敏感词检查",
+  28: "正传事件冲突",
+  29: "未来信息泄露",
+  30: "世界规则跨书一致性",
+  31: "番外伏笔隔离",
+  32: "读者期待管理",
 };
 
 function buildDimensionList(
   gp: GenreProfile,
   bookRules: BookRules | null,
+  hasParentCanon = false,
 ): ReadonlyArray<{ readonly id: number; readonly name: string; readonly note: string }> {
   const activeIds = new Set(gp.auditDimensions);
 
@@ -62,9 +68,20 @@ function buildDimensionList(
     }
   }
 
+  // Always-active dimensions
+  activeIds.add(32); // 读者期待管理 — universal
+
   // Conditional overrides
   if (gp.eraResearch || bookRules?.eraConstraints?.enabled) {
     activeIds.add(12);
+  }
+
+  // Spinoff dimensions — activated when parent_canon.md exists
+  if (hasParentCanon) {
+    activeIds.add(28); // 正传事件冲突
+    activeIds.add(29); // 未来信息泄露
+    activeIds.add(30); // 世界规则跨书一致性
+    activeIds.add(31); // 番外伏笔隔离
   }
 
   const dims: Array<{ id: number; name: string; note: string }> = [];
@@ -100,6 +117,21 @@ function buildDimensionList(
     if (id === 26) {
       note = "检查章节类型节奏：连续≥3同类型章→warning，≥5章无高潮/回收→warning";
     }
+    if (id === 28) {
+      note = "检查番外事件是否与正典约束表矛盾";
+    }
+    if (id === 29) {
+      note = "检查角色是否引用了分歧点之后才揭示的信息（参照信息边界表）";
+    }
+    if (id === 30) {
+      note = "检查番外是否违反正传世界规则（力量体系、地理、阵营）";
+    }
+    if (id === 31) {
+      note = "检查番外是否越权回收正传伏笔（warning级别）";
+    }
+    if (id === 32) {
+      note = "检查：章尾是否有钩子？最近3-5章内是否有爽点落地？是否存在超过3章的情绪压制无释放？读者的情绪缺口是否在积累或被满足？";
+    }
 
     dims.push({ id, name, note });
   }
@@ -118,7 +150,7 @@ export class ContinuityAuditor extends BaseAgent {
     chapterNumber: number,
     genre?: string,
   ): Promise<AuditResult> {
-    const [currentState, ledger, hooks, styleGuideRaw, subplotBoard, emotionalArcs, characterMatrix, chapterSummaries] =
+    const [currentState, ledger, hooks, styleGuideRaw, subplotBoard, emotionalArcs, characterMatrix, chapterSummaries, parentCanon] =
       await Promise.all([
         this.readFileSafe(join(bookDir, "story/current_state.md")),
         this.readFileSafe(join(bookDir, "story/particle_ledger.md")),
@@ -128,7 +160,10 @@ export class ContinuityAuditor extends BaseAgent {
         this.readFileSafe(join(bookDir, "story/emotional_arcs.md")),
         this.readFileSafe(join(bookDir, "story/character_matrix.md")),
         this.readFileSafe(join(bookDir, "story/chapter_summaries.md")),
+        this.readFileSafe(join(bookDir, "story/parent_canon.md")),
       ]);
+
+    const hasParentCanon = parentCanon !== "(文件不存在)";
 
     // Load genre profile and book rules
     const genreId = genre ?? "other";
@@ -141,7 +176,7 @@ export class ContinuityAuditor extends BaseAgent {
       ? styleGuideRaw
       : (parsedRules?.body ?? "(无文风指南)");
 
-    const dimensions = buildDimensionList(gp, bookRules);
+    const dimensions = buildDimensionList(gp, bookRules, hasParentCanon);
     const dimList = dimensions
       .map((d) => `${d.id}. ${d.name}${d.note ? `（${d.note}）` : ""}`)
       .join("\n");
@@ -150,7 +185,11 @@ export class ContinuityAuditor extends BaseAgent {
       ? `\n主角人设锁定：${bookRules.protagonist.name}，${bookRules.protagonist.personalityLock.join("、")}，行为约束：${bookRules.protagonist.behavioralConstraints.join("、")}`
       : "";
 
-    const systemPrompt = `你是一位严格的${gp.name}网络小说审稿编辑。你的任务是对章节进行连续性、一致性和质量审查。${protagonistBlock}
+    const searchNote = gp.eraResearch
+      ? "\n\n你有联网搜索能力（search_web / fetch_url）。对于涉及真实年代、人物、事件、地理、政策的内容，你必须用search_web核实，不可凭记忆判断。至少对比2个来源交叉验证。"
+      : "";
+
+    const systemPrompt = `你是一位严格的${gp.name}网络小说审稿编辑。你的任务是对章节进行连续性、一致性和质量审查。${protagonistBlock}${searchNote}
 
 审查维度：
 ${dimList}
@@ -188,6 +227,10 @@ ${dimList}
       ? `\n## 章节摘要（用于节奏检查）\n${chapterSummaries}\n`
       : "";
 
+    const canonBlock = hasParentCanon
+      ? `\n## 正传正典参照（番外审查专用）\n${parentCanon}\n`
+      : "";
+
     const userPrompt = `请审查第${chapterNumber}章。
 
 ## 当前状态卡
@@ -195,20 +238,23 @@ ${currentState}
 ${ledgerBlock}
 ## 伏笔池
 ${hooks}
-${subplotBlock}${emotionalBlock}${matrixBlock}${summariesBlock}
+${subplotBlock}${emotionalBlock}${matrixBlock}${summariesBlock}${canonBlock}
 ## 文风指南
 ${styleGuide}
 
 ## 待审章节内容
 ${chapterContent}`;
 
-    const response = await this.chat(
-      [
-        { role: "system", content: systemPrompt },
-        { role: "user", content: userPrompt },
-      ],
-      { temperature: 0.3, maxTokens: 4096 },
-    );
+    const chatMessages = [
+      { role: "system" as const, content: systemPrompt },
+      { role: "user" as const, content: userPrompt },
+    ];
+    const chatOptions = { temperature: 0.3, maxTokens: 4096 };
+
+    // Use web search for fact verification when eraResearch is enabled
+    const response = gp.eraResearch
+      ? await this.chatWithSearch(chatMessages, chatOptions)
+      : await this.chat(chatMessages, chatOptions);
 
     return this.parseAuditResult(response.content);
   }
